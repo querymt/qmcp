@@ -159,6 +159,24 @@ pub fn http_router_with_oauth(
         .route("/.well-known/oauth-protected-resource/mcp", discovery))
 }
 
+/// Embedded single-owner OAuth. Its outer guard covers AS, MCP and fallback routes;
+/// only the browser consent POST accepts Origin, never the MCP transport.
+pub fn http_router_with_local_oauth(
+    server: QmcpServer,
+    bind: SocketAddr,
+    auth: crate::local_oauth::LocalOAuth,
+    allowed_hosts: &[String],
+) -> Result<Router> {
+    let mut hosts = allowed_hosts.to_vec();
+    hosts.push(auth.authority().into());
+    let config = http_config(bind, true, &hosts)?;
+    let mcp = build_http_router(server, config).layer(middleware::from_fn_with_state(
+        auth.clone(),
+        crate::local_oauth::require_token,
+    ));
+    Ok(auth.guard(mcp.merge(auth.routes())))
+}
+
 async fn guard_discovery(
     State(hosts): State<Vec<String>>,
     request: Request,

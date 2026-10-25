@@ -10,6 +10,7 @@ use serde_json::{Map, Value, json};
 use qmacp::{client::AcpClient, error::CliError, session};
 
 use crate::output::{self, BatchState, OperationState};
+use crate::workspace::{Binding, Workspaces};
 
 const MIN_SECONDS: u64 = 1;
 const MAX_SECONDS: u64 = 86_400;
@@ -86,7 +87,13 @@ pub enum Command {
         query: Option<String>,
         provider: Option<String>,
     },
-    /// Create a session without sending a prompt.
+    /// Select a sticky per-session workspace without sending a prompt. With no session_id, an explicit cwd is required and creates a NEW QueryMT session. With an existing ID, omitted/same cwd selects that ID; different cwd creates a NEW ID and returns previousSessionId. Use the returned sessionId in later calls; the old session is untouched. Known profiles are inherited on switches, otherwise the backend default is used (unknown). Profile changes on the same workspace are not supported. Paths are POSIX paths on the QueryMT host; no ~ expansion.
+    Workspace {
+        session_id: Option<String>,
+        cwd: Option<PathBuf>,
+        profile: Option<String>,
+    },
+    /// Create a session without sending a prompt. cwd is remembered immediately; later session calls can omit it. Relative cwd uses qmcp startup cwd; paths refer to the QueryMT host, with no ~ expansion.
     New {
         cwd: Option<PathBuf>,
         profile: Option<String>,
@@ -130,7 +137,7 @@ pub enum Command {
     Pin { session_id: String },
     /// Unpin a session.
     Unpin { session_id: String },
-    /// Read compact session history, or the full raw snapshot when full is true.
+    /// Read compact session history, or the full raw snapshot when full is true. Omit cwd to use the session's remembered or authoritative metadata workspace. Different cwd is rejected; use workspace to create a NEW session. Never creates or rebinds a session.
     Inspect {
         session_id: String,
         cwd: Option<PathBuf>,
@@ -140,7 +147,7 @@ pub enum Command {
         #[serde(default = "default_true")]
         tools: bool,
     },
-    /// Current mode/model/profile/effort for a session.
+    /// Read current mode/model/profile/effort for a session. Omit cwd to use its remembered or authoritative metadata workspace. Different cwd is rejected; use workspace to create a NEW session. Never creates or rebinds a session.
     Status {
         session_id: String,
         cwd: Option<PathBuf>,
@@ -151,7 +158,7 @@ pub enum Command {
     SetModel { session_id: String, model: String },
     /// Set reasoning effort (auto, low, medium, high, or max).
     SetEffort { session_id: String, effort: String },
-    /// Send text to a session, or create one with new=true. Auto delivery prompts when idle, steers when possible, otherwise queues.
+    /// Send text to a session, or create one with new=true. cwd is sticky per session: omit it on later calls. Explicit different cwd creates a NEW QueryMT session, returns previousSessionId and the NEW sessionId to use later, and leaves the old session untouched. Relative cwd uses the selected session cwd (or qmcp startup cwd for new=true). No ~ expansion. Known profiles are inherited on switches; unknown uses the backend default. Same-workspace profile changes are rejected. Auto delivery prompts when idle, steers when possible, otherwise queues.
     Prompt {
         #[serde(default)]
         new: bool,
@@ -174,7 +181,7 @@ pub enum Command {
     },
     /// Current QueryMT runtime state for a session.
     Runtime { session_id: String },
-    /// Collect compact session events until idle. Supply cwd for the session workspace.
+    /// Collect compact session events until idle. Omit cwd to use its remembered or authoritative metadata workspace. Different cwd is rejected; use workspace to create a NEW session. Never creates or rebinds a session.
     Follow {
         session_id: String,
         cwd: Option<PathBuf>,
@@ -246,6 +253,11 @@ pub fn decode(name: &str, mut arguments: Map<String, Value>) -> Result<Command> 
     let command: Command =
         serde_json::from_value(Value::Object(arguments)).context("invalid tool arguments")?;
     match &command {
+        Command::Workspace {
+            session_id: None,
+            cwd: None,
+            ..
+        } => bail!("workspace requires an explicit initial cwd when session_id is omitted"),
         Command::Prompt {
             new,
             session_id,
@@ -385,7 +397,15 @@ fn constrain_input_schema(name: &str, input: &mut Map<String, Value>) {
     if matches!(name, "prompt" | "steer" | "queue") {
         properties["text"]["pattern"] = json!(NON_BLANK_TEXT_PATTERN);
     }
-    if name == "prompt" {
+    if name == "workspace" {
+        input.insert(
+            "anyOf".into(),
+            json!([
+                {"required": ["session_id"], "properties": {"session_id": {"type": "string"}}},
+                {"required": ["cwd"], "properties": {"cwd": {"type": "string"}}},
+            ]),
+        );
+    } else if name == "prompt" {
         input.insert("oneOf".into(), json!([
             {"required": ["new"], "properties": {"new": {"const": true}, "session_id": {"type": "null"}}},
             {"required": ["session_id"], "properties": {"new": {"const": false}, "session_id": {"type": "string"}}},
@@ -417,6 +437,7 @@ pub async fn run(
     command: Command,
     state: &mut OperationState,
     deadline: Option<tokio::time::Instant>,
+    workspaces: &Workspaces,
 ) -> Value {
     let deadline = deadline.or_else(|| {
         command
@@ -427,7 +448,7 @@ pub async fn run(
     state.recovery.clear();
     let operation = async {
         client.clear_assistant_text().await;
-        run_inner(client, command, state).await
+        run_inner(client, command, state, workspaces).await
     };
     let outcome = match deadline {
         Some(deadline) => tokio::time::timeout_at(deadline, operation)
@@ -454,6 +475,7 @@ async fn run_inner(
     client: &AcpClient,
     command: Command,
     state: &mut OperationState,
+    workspaces: &Workspaces,
 ) -> Result<Value, CliError> {
     let result = match command {
         Command::Caps {} => caps(client).await?,
@@ -463,13 +485,31 @@ async fn run_inner(
             query,
             provider,
         } => models(client, refresh, query, provider).await?,
+        Command::Workspace {
+            session_id,
+            cwd,
+            profile,
+        } => workspaces
+            .select(client, state, session_id, cwd, profile)
+            .await?
+            .result(),
         Command::New {
             cwd,
             profile,
             mode,
             model,
             effort,
-        } => new_session(client, state, cwd, profile, mode, model, effort).await?,
+        } => {
+            new_session(
+                client,
+                state,
+                workspaces,
+                cwd,
+                profile,
+                (mode, model, effort),
+            )
+            .await?
+        }
         Command::Sessions {
             cwd,
             cursor,
@@ -481,7 +521,8 @@ async fn run_inner(
         } => {
             sessions(
                 client,
-                cwd,
+                cwd.map(|cwd| workspaces.initial_cwd(Some(cwd)))
+                    .transpose()?,
                 cursor,
                 all,
                 limit,
@@ -504,7 +545,8 @@ async fn run_inner(
         } => {
             find(
                 client,
-                cwd,
+                cwd.map(|cwd| workspaces.initial_cwd(Some(cwd)))
+                    .transpose()?,
                 query,
                 phase,
                 limit,
@@ -530,8 +572,14 @@ async fn run_inner(
             full,
             messages,
             tools,
-        } => inspect(client, session_id, cwd, full, messages, tools).await?,
-        Command::Status { session_id, cwd } => status(client, session_id, cwd).await?,
+        } => {
+            let cwd = workspaces.read_cwd(client, &session_id, cwd).await?;
+            inspect(client, session_id, cwd, full, messages, tools).await?
+        }
+        Command::Status { session_id, cwd } => {
+            let cwd = workspaces.read_cwd(client, &session_id, cwd).await?;
+            status(client, session_id, cwd).await?
+        }
         Command::SetMode { session_id, mode } => set_mode(client, session_id, mode).await?,
         Command::SetModel { session_id, model } => set_model(client, session_id, model).await?,
         Command::SetEffort { session_id, effort } => set_effort(client, session_id, effort).await?,
@@ -560,7 +608,7 @@ async fn run_inner(
                 delivery,
                 until_idle,
             };
-            prompt(client, state, args).await?
+            prompt(client, state, workspaces, args).await?
         }
         Command::Runtime { session_id } => runtime(client, session_id).await?,
         Command::Follow {
@@ -568,7 +616,10 @@ async fn run_inner(
             cwd,
             interval,
             timeout,
-        } => follow(client, session_id, cwd, interval, timeout).await?,
+        } => {
+            let cwd = workspaces.read_cwd(client, &session_id, cwd).await?;
+            follow(client, session_id, cwd, interval, timeout).await?
+        }
         Command::Watch {
             session_id,
             interval,
@@ -605,7 +656,7 @@ async fn run_inner(
             session_id,
             input_id,
         } => discard_queued(client, session_id, input_id).await?,
-        Command::Exec { calls } => exec(client, calls, state).await?,
+        Command::Exec { calls } => exec(client, calls, state, workspaces).await?,
         Command::Cancel { session_id } => cancel(client, session_id).await?,
         Command::Close { session_id } => close(client, session_id).await?,
     };
@@ -677,30 +728,33 @@ async fn models(
 async fn new_session(
     client: &AcpClient,
     state: &mut OperationState,
+    workspaces: &Workspaces,
     cwd: Option<PathBuf>,
     profile: Option<String>,
-    mode: Option<String>,
-    model: Option<String>,
-    effort: Option<String>,
+    config: (Option<String>, Option<String>, Option<String>),
 ) -> Result<Value, CliError> {
-    client.initialize().await.map_err(CliError::from_request)?;
-    let cwd = session::resolve_cwd(cwd).map_err(CliError::rpc)?;
-    let (created, created_raw) = client
-        .new_session(cwd.clone(), profile.as_deref())
-        .await
-        .map_err(CliError::from_request)?;
-    let session_id = created.session_id.to_string();
-    state.session(&session_id, &cwd, true);
-    apply_config(client, &session_id, mode, model, effort).await?;
+    let binding = Binding {
+        cwd: workspaces.initial_cwd(cwd)?,
+        profile,
+    };
+    let source = if binding.profile.is_some() {
+        "explicit"
+    } else {
+        "backend-default-unknown"
+    };
+    let (selected, created, created_raw) = workspaces
+        .create(client, state, binding, None, source)
+        .await?;
+    let session_id = &selected.session_id;
+    let cwd = &selected.binding.cwd;
+    apply_config(client, session_id, config.0, config.1, config.2).await?;
     let status = match open_session(client, session_id.clone(), cwd.clone()).await {
         Ok(opened) => opened.status,
-        Err(_) => session::config_status(&session_id, created.modes.as_ref(), &created_raw),
+        Err(_) => session::config_status(session_id, created.modes.as_ref(), &created_raw),
     };
-    Ok(json!({
-        "sessionId": session_id,
-        "cwd": cwd,
-        "status": status,
-    }))
+    let mut result = selected.result();
+    result["status"] = status;
+    Ok(result)
 }
 
 async fn sessions(
@@ -1000,7 +1054,7 @@ async fn set_pinned(
 async fn inspect(
     client: &AcpClient,
     session_id: String,
-    cwd: Option<PathBuf>,
+    cwd: PathBuf,
     full: bool,
     messages: Option<usize>,
     tools: bool,
@@ -1009,11 +1063,16 @@ async fn inspect(
     if !initialized.agent_capabilities.load_session {
         return Err(CliError::rpc("agent does not support session/load"));
     }
-    let cwd = session::resolve_cwd(cwd).map_err(CliError::rpc)?;
     let (loaded, load_value) = client
         .load_session(session_id.clone(), cwd.clone())
         .await
-        .map_err(CliError::from_request)?;
+        .map_err(|error| {
+            if error.to_string().contains("Loaded session has no runtime ref for ACP replay") {
+                CliError::rpc("QueryMT backend cannot replay this session's history: Loaded session has no runtime ref for ACP replay. History is unavailable, not empty; qmcp cannot repair the owning runtime. No fallback was attempted.")
+            } else {
+                CliError::from_request(error)
+            }
+        })?;
     if full {
         return Ok(json!({
             "sessionId": session_id,
@@ -1036,14 +1095,10 @@ async fn inspect(
     ))
 }
 
-async fn status(
-    client: &AcpClient,
-    session_id: String,
-    cwd: Option<PathBuf>,
-) -> Result<Value, CliError> {
+async fn status(client: &AcpClient, session_id: String, cwd: PathBuf) -> Result<Value, CliError> {
     client.initialize().await.map_err(CliError::from_request)?;
-    let cwd = session::resolve_cwd(cwd).map_err(CliError::rpc)?;
-    let opened = open_session(client, session_id.clone(), cwd).await?;
+    let mut opened = open_session(client, session_id.clone(), cwd.clone()).await?;
+    opened.status["cwd"] = json!(cwd);
     Ok(opened.status)
 }
 
@@ -1115,6 +1170,7 @@ struct PromptArgs {
 async fn prompt(
     client: &AcpClient,
     state: &mut OperationState,
+    workspaces: &Workspaces,
     args: PromptArgs,
 ) -> Result<Value, CliError> {
     let PromptArgs {
@@ -1130,21 +1186,30 @@ async fn prompt(
         until_idle,
     } = args;
     let initialized = client.initialize().await.map_err(CliError::from_request)?;
-    let cwd = session::resolve_cwd(cwd).map_err(CliError::rpc)?;
-    let session_id = if new {
-        let (created, _) = client
-            .new_session(cwd.clone(), profile.as_deref())
-            .await
-            .map_err(CliError::from_request)?;
-        let session_id = created.session_id.to_string();
-        state.session(&session_id, &cwd, true);
-        session_id
+    let selected = if new {
+        let binding = Binding {
+            cwd: workspaces.initial_cwd(cwd)?,
+            profile,
+        };
+        let source = if binding.profile.is_some() {
+            "explicit"
+        } else {
+            "backend-default-unknown"
+        };
+        workspaces
+            .create(client, state, binding, None, source)
+            .await?
+            .0
     } else {
         let session_id = session_id
             .ok_or_else(|| CliError::Usage("prompt requires session_id or new=true".into()))?;
-        state.session(&session_id, &cwd, false);
-        session_id
+        workspaces
+            .select(client, state, Some(session_id), cwd, profile)
+            .await?
     };
+    selected.checkpoint(state);
+    let session_id = selected.session_id.clone();
+    let cwd = selected.binding.cwd.clone();
     // Keep the session id observable even if configuration or the prompt later fails.
     client
         .emit(json!({ "type": "session", "sessionId": session_id, "cwd": cwd }))
@@ -1153,12 +1218,12 @@ async fn prompt(
     state
         .recovery
         .insert("deliveryState".into(), json!("not_submitted"));
-    let chosen = if new {
+    let chosen = if selected.created {
         Delivery::Prompt
     } else {
         choose_delivery(client, &session_id, delivery).await?
     };
-    if !new && chosen == Delivery::Prompt {
+    if !selected.created && chosen == Delivery::Prompt {
         open_session(client, session_id.clone(), cwd.clone()).await?;
     }
     apply_config(client, &session_id, mode, model, effort).await?;
@@ -1200,17 +1265,24 @@ async fn prompt(
         wait_until_idle(client, &session_id, Duration::from_secs(u32::MAX.into())).await?;
     }
     let text = client.take_assistant_text().await;
-    Ok(json!({
-        "type": "done",
-        "sessionId": session_id,
-        "delivery": delivery_name(chosen),
-        "stopReason": stop_reason,
-        "text": text,
-        "submitted": submitted,
-        "deliveryState": "accepted",
-        "observationState": if until_idle { "idle" } else if chosen == Delivery::Prompt { "prompt_returned" } else { "not_waited" },
-        "loadSession": initialized.agent_capabilities.load_session,
-    }))
+    let mut result = selected.result();
+    result.as_object_mut().unwrap().extend(
+        json!({
+            "type": "done",
+            "sessionId": session_id,
+            "delivery": delivery_name(chosen),
+            "stopReason": stop_reason,
+            "text": text,
+            "submitted": submitted,
+            "deliveryState": "accepted",
+            "observationState": if until_idle { "idle" } else if chosen == Delivery::Prompt { "prompt_returned" } else { "not_waited" },
+            "loadSession": initialized.agent_capabilities.load_session,
+        })
+        .as_object()
+        .unwrap()
+        .clone(),
+    );
+    Ok(result)
 }
 
 fn delivery_name(delivery: Delivery) -> &'static str {
@@ -1294,12 +1366,11 @@ async fn wait_until_idle_every(
 async fn follow(
     client: &AcpClient,
     session_id: String,
-    cwd: Option<PathBuf>,
+    cwd: PathBuf,
     interval: u64,
     timeout: u64,
 ) -> Result<Value, CliError> {
     client.initialize().await.map_err(CliError::from_request)?;
-    let cwd = session::resolve_cwd(cwd).map_err(CliError::rpc)?;
     open_session(client, session_id.clone(), cwd.clone()).await?;
     client.clear_assistant_text().await;
     wait_until_idle_every(
@@ -1310,15 +1381,22 @@ async fn follow(
     )
     .await?;
     let mut text = client.take_assistant_text().await;
-    if text.is_empty()
-        && let Ok(snapshot) =
-            inspect(client, session_id.clone(), Some(cwd), false, Some(1), false).await
-    {
+    if text.is_empty() {
+        let snapshot = inspect(
+            client,
+            session_id.clone(),
+            cwd.clone(),
+            false,
+            Some(1),
+            false,
+        )
+        .await?;
         text = session::last_assistant_text(&snapshot).unwrap_or_default();
     }
     Ok(json!({
         "type": "done",
         "sessionId": session_id,
+        "cwd": cwd,
         "stopReason": "idle",
         "text": text,
     }))
@@ -1448,12 +1526,13 @@ async fn exec(
     client: &AcpClient,
     calls: Vec<BatchCall>,
     state: &mut OperationState,
+    workspaces: &Workspaces,
 ) -> Result<Value, CliError> {
     state.batch = Some(BatchState::default());
     for call in calls {
         state.batch.as_mut().expect("batch initialized").active_call = Some(call.name.clone());
         let command = decode(&call.name, call.arguments).map_err(CliError::rpc)?;
-        let result = Box::pin(run(client, command, state, None)).await;
+        let result = Box::pin(run(client, command, state, None, workspaces)).await;
         let batch = state.batch.as_mut().expect("batch initialized");
         batch.text_truncated |= result["textTruncated"] == true;
         if output::failed(&result) {

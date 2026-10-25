@@ -496,7 +496,7 @@ mod tests {
                 .as_array()
                 .unwrap()
                 .len(),
-            25
+            26
         );
         current.lock().unwrap()["active"] = json!(false);
         let response = call(Some("active-token")).await.unwrap();
